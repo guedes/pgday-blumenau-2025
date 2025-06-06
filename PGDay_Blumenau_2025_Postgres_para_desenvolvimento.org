@@ -1,0 +1,490 @@
+#+title: PgDay Blumenau - 2025: Postgres para desenvolvimento
+
+* Postgres para desenvolvimento
+
+** PgDay Blumenau - 2025
+** Dickson S. Guedes
+- <guedes at timbira.com.br>
+- https://www.pgtri.be/
+
+* Tipos de dados para além dos trivial
+** Um problema hipotético
+
+Imagine que você está desenvolvendo um sistema de reservas e precisa de:
+
+- Um identificador único que funcione mesmo em ambientes distribuídos.
+- Um campo para o estado da reserva, com valores pré-definidos.
+- Marcar categorias ou etiquetas por reserva:
+  - como "prioritário", "grupo", "VIP".
+- Representar um intervalo de tempo (check-in/check-out)
+  - evitar que duas reservas se sobreponham
+
+** Como o Postgres resolve
+
+#+begin_src sql
+create type booking_status
+       as enum ('pending', 'confirmed', 'cancelled');
+
+create table booking (
+  id         uuid primary key        default gen_random_uuid(),
+  status     booking_status not null default 'pending',
+  tags       text[],
+  period     daterange,
+  created_at timestamp               default now()
+);
+#+end_src
+
+** Inserindo dados
+#+begin_src sql
+insert into booking (tags, period)
+       values(array['prioritario', 'vip'], daterange('2025-01-01', '2025-01-02')
+        )
+#+end_src
+** Reservas VIP ainda pendentes
+
+#+begin_src sql
+select *
+  from booking
+ where status = 'pendng'
+   and 'vip' = any(tags);
+#+end_src
+
+** Reservas em um intervalo de datas
+
+#+begin_src sql
+select *
+  from booking
+ where period && daterange('2025-01-01', '2025-01-10');
+#+end_src
+
+** Links
+- https://www.postgresql.org/docs/17/datatype-uuid.html
+- https://www.postgresql.org/docs/17/rangetypes.html#RANGETYPES-BUILTIN
+* Um pouco mais sobre intervalos
+
+#+begin_src sql
+create table reservas (
+  id serial primary key,
+  periodo daterange
+);
+
+insert into reservas (periodo) values
+  (daterange('2024-01-05', '2024-01-10')),
+  (daterange('2024-01-15', '2024-01-20')),
+  (daterange('2024-01-08', '2024-01-12', '()'));
+
+select *
+  from reservas
+ where periodo && daterange('2024-01-09', '2024-01-11');
+
+select *
+  from reservas
+ where periodo @> date '2024-01-06';
+
+select * from reservas
+where daterange('2024-01-06', '2024-01-07') <@ periodo;
+
+create index on reservas using gist (periodo);
+
+select
+  id,
+  lower(periodo) as inicio,
+  upper(periodo) as fim,
+  lower_inc(periodo) as inicio_inclusivo,
+  upper_inc(periodo) as fim_inclusivo
+from reservas;
+#+end_src
+
+* Views e CTEs para estruturar consultas
+
+** Um problema hipotético
+
+- Você tem uma consulta complexa que se repete com frequência em dashboards ou relatórios.
+- Manter a lógica duplicada no app ou em múltiplas consultas é arriscado e difícil de manter.
+- Queremos mostrar um dashboard com os usuários que mais gastaram nos últimos 30 dias.
+
+** Como o Postgres resolve
+#+begin_src sql
+with
+recent_payments as (
+  select user_id, amount
+    from payments
+   where paid_at >= now() - interval '30 days'
+),
+user_totals as (
+  select user_id,
+         sum(amount) as total_spent
+    from recent_payments
+   group by user_id
+)
+select *
+  from user_totals
+ where total_spent > 500;
+#+end_src
+
+** Na sua aplicação poderia...
+#+begin_src python
+...
+
+RECENT_PAYMENTS = """
+  select user_id, amount
+    from payments
+   where paid_at >= now() - interval '30 days'
+"""
+...
+def get_recent_spent(db, min_spent_value) -> List:
+    result = db.execute(f"""
+               with
+               recent_payments as (
+                 {{RECENT_PAYMENTS}}
+               ),
+               user_totals as (
+                 select user_id,
+                        sum(amount) as total_spent
+                   from recent_payments
+                  group by user_id
+               )
+               select *
+                 from user_totals
+                where total_spent > %(min_spent_value)
+    """, min_spent_value)
+    return result
+#+end_src
+
+* Trabalhando com JSON
+
+- Você recebe eventos via webhook com estruturas que variam ao longo do tempo.
+- Você precisa realizar busca com base em valores em chaves encadeadas
+
+** Exemplo de código
+
+#+begin_src sql
+create table events (
+  id serial primary key,
+  metadata jsonb not null check (metadata ? 'user_id'),
+  created_at timestamp default now()
+);
+
+insert into events (metadata) values (
+  '{"device": "mobile", "version": "2.0", "user_id": 42}'
+);
+#+end_src
+
+** Eventos de dispositivos mobile
+
+#+begin_src sql
+select *
+  from events
+ where metadata @> '{"device": "mobile"}';
+#+end_src
+
+** Eventos de uma versão específica
+
+#+begin_src sql
+select *
+  from events
+ where metadata ->> 'version' = '2.0';
+#+end_src
+
+** Eventos que possuem a chave "user_id"
+#+begin_src sql
+select *
+  from events
+ where metadata ? 'user_id';
+#+end_src
+
+** Navegando de modo mais intuitivo
+#+begin_src sql
+create table produtos (
+  id serial primary key,
+  dados jsonb
+);
+
+insert into produtos (dados) values (
+  '{
+    "nome": "Smartphone X",
+    "especificacoes": {
+      "armazenamento": "128GB",
+      "cor": "Preto",
+      "dimensoes": {
+        "altura": "150mm",
+        "largura": "70mm"
+      }
+    },
+    "preco": 2999.99,
+    "disponivel": true
+  }'
+);
+
+select dados['nome'] as nome_produto
+  from produtos;
+
+select dados['especificacoes']['cor'] as cor_produto
+  from produtos;
+
+select dados['especificacoes']['dimensoes']['altura'] as altura_produto
+  from produtos;
+
+update produtos
+   set dados['preco'] = '2799.99'
+ where id = 1;
+
+update produtos
+   set dados['especificacoes']['peso'] = '"200g"'
+ where id = 1;
+
+#+end_src
+
+** Atualização sem alterar
+
+#+begin_src sql
+update events
+set metadata = jsonb_set(metadata, '{version}', '"2.1"')
+where id = 1;
+#+end_src
+
+** Pipeline de dados
+
+#+begin_src sql
+with
+dados_selecionados as (
+   select *
+     from dados_de_uma_api
+    where payload -> 'chave1' ->> 'sub_chave' = 'valor'
+),
+mascaramento (
+   select jsonb_set(payload, '{chave1, sub_chave}', '****') as payload
+     from dados_selecionados
+),
+transformacao (
+   select payload ->> 'id'                   as id,
+          payload -> 'chave1' -> 'sub_chave' as chave,
+          upper(payload ->> 'nome')          as nome
+     from mascaramento
+)
+insert into destino
+       select id, chave, nome
+         from transformacao
+#+end_src
+
+* JSON Table
+
+** Um exemplo geral
+#+begin_src sql
+create table orders (
+  id serial primary key,
+  order_data jsonb
+);
+#+end_src
+
+#+begin_src sql
+insert into orders (order_data) values (
+  '{
+    "order_id": 1001,
+    "customer": "João Silva",
+    "items": [
+      { "product": "Notebook", "price": 3500.00, "quantity": 1 },
+      { "product": "Mouse", "price": 150.00, "quantity": 2 }
+    ]
+  }'
+);
+
+insert into orders (order_data) values (
+  '{
+    "order_id": 1002,
+    "customer": "Maria Silva",
+    "items": [
+      { "product": "Monitor", "price": 500.00, "quantity": 3 },
+      { "product": "Microfone", "price": 150.00, "quantity": 1 }
+    ]
+  }'
+);
+#+end_src
+
+#+begin_src sql
+select orders.id, .*
+-- select jt.*
+from orders,
+     json_table(
+       order_data,
+       '$.items[*]' -- Json Path
+       columns (
+         product  text    path '$.product',
+         price    numeric path '$.price',
+         quantity int     path '$.quantity'
+       )
+     ) as jt;
+#+end_src
+
+** Com aninhamento
+
+#+begin_src sql
+select *
+  from json_table (
+
+'{"favorites":
+    [{"movies":
+      [{"name": "One", "director": "John Doe"},
+       {"name": "Two", "director": "Don Joe"}],
+     "books":
+      [{"name": "Mystery", "authors": [{"name": "Brown Dan"}]},
+       {"name": "Wonder", "authors": [{"name": "Jun Murakami"}, {"name":"Craig Doe"}]}]
+}]}'::json,
+
+'$.favorites[*]'
+columns (
+  user_id for ordinality,
+  nested '$.movies[*]'
+    columns (
+       movie_id for ordinality,
+       mname text path '$.name',
+       director text
+    ),
+  nested '$.books[*]'
+    columns (
+      book_id for ordinality,
+      bname text path '$.name',
+      nested '$.authors[*]'
+        columns (
+          author_id for ordinality,
+          author_name text path '$.name'
+        )
+    )
+  )
+);
+#+end_src
+
+** Um outro exemplo
+
+#+begin_src sql
+create table dados (
+  id serial primary key,
+  conteudo jsonb
+);
+
+insert into dados (conteudo) values (
+  '{
+    "configuration": {
+      "max_connections": {
+        "name": "max_connections",
+        "value": "100",
+        "unit": null,
+        "boot_val": "100",
+        "reset_val": "100",
+        "source": "configuration file",
+        "sourcefile": "/etc/postgresql/16/main/postgresql.conf",
+        "sourceline": 65,
+        "pending_restart": false
+      },
+      "enable_partitionwise_join": {
+        "name": "enable_partitionwise_join",
+        "value": "off",
+        "unit": null,
+        "boot_val": "off",
+        "reset_val": "off",
+        "source": "default",
+        "sourcefile": null,
+        "sourceline": null,
+        "pending_restart": false
+      }
+    }
+  }'
+);
+
+insert into dados (conteudo) values (
+  '{
+    "configuration": {
+      "max_connections": {
+        "name": "max_connections",
+        "value": "1000",
+        "unit": null,
+        "boot_val": "100",
+        "reset_val": "100",
+        "source": "configuration file",
+        "sourcefile": "/etc/postgresql/16/main/postgresql.conf",
+        "sourceline": 65,
+        "pending_restart": false
+      },
+      "enable_partitionwise_join": {
+        "name": "enable_partitionwise_join",
+        "value": "on",
+        "unit": null,
+        "boot_val": "off",
+        "reset_val": "off",
+        "source": "default",
+        "sourcefile": null,
+        "sourceline": null,
+        "pending_restart": false
+      }
+    }
+  }'
+);
+
+#+end_src
+
+#+begin_src sql
+SELECT d.id, conf.*
+FROM dados d,
+LATERAL JSON_TABLE(
+  d.conteudo,
+  '$.configuration.*'
+  COLUMNS (
+    name TEXT PATH '$.name',
+    value TEXT PATH '$.value',
+    unit TEXT PATH '$.unit',
+    boot_val TEXT PATH '$.boot_val',
+    reset_val TEXT PATH '$.reset_val',
+    source TEXT PATH '$.source',
+    sourcefile TEXT PATH '$.sourcefile',
+    sourceline INT PATH '$.sourceline',
+    pending_restart BOOLEAN PATH '$.pending_restart'
+  )
+) AS conf;
+#+end_src
+
+#+begin_example
+ id │           name            │ value │ unit │ boot_val │ reset_val │       source       │               sourcefile                │ sourceline │ pending_restart
+════╪═══════════════════════════╪═══════╪══════╪══════════╪═══════════╪════════════════════╪═════════════════════════════════════════╪════════════╪═════════════════
+  1 │ max_connections           │ 100   │ ¤    │ 100      │ 100       │ configuration file │ /etc/postgresql/16/main/postgresql.conf │         65 │ f
+  1 │ enable_partitionwise_join │ off   │ ¤    │ off      │ off       │ default            │ ¤                                       │          ¤ │ f
+  2 │ max_connections           │ 1000  │ ¤    │ 100      │ 100       │ configuration file │ /etc/postgresql/16/main/postgresql.conf │         65 │ f
+  2 │ enable_partitionwise_join │ on    │ ¤    │ off      │ off       │ default            │ ¤                                       │          ¤ │ f
+(4 linhas)
+#+end_example
+
+* Notificação assíncrona
+
+#+begin_src sql
+-- Terminal 1
+LISTEN sistema_alerta;
+
+-- Terminal 2
+NOTIFY sistema_alerta;
+#+end_src
+
+Enviando uma "carga útil"
+
+#+begin_src sql
+-- Terminal 2
+NOTIFY sistema_alerta, 'event=novo_usuario;id=42';
+#+end_src
+
+#+begin_src sql
+-- Terminal 1
+SELECT pg_notify('sistema_alerta', 'event=novo_usuario;id=42');
+#+end_src
+
+8GB para essa "fila" (vide max_notify_queue_pages)
+#+begin_src sql
+select *
+  from pg_notification_queue_usage();
+
+ pg_notification_queue_usage
+═════════════════════════════
+                           0
+#+end_src
+
+* Obrigado!
+
+Dickson S. Guedes
+Consultor @ Timbira
